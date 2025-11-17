@@ -1,0 +1,267 @@
+---
+title: "Myrf Optic Nerve Diameter"
+author: "Matt Nolan & Jenea Bin"
+date: '2025-10-28'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r include=FALSE}
+library(tidyverse)
+library(readxl)
+library(lme4)
+library(cowplot)
+library(philentropy)
+library(lqmm)
+library(purrr)
+library(nlme)
+library(dplyr)
+```
+
+# Goals
+We have a data set that contains diameters of axons in the optic nerve of control and Myrf cKO mice, calculated from cross-sectional area (assuming circular). We'd like to know if the mean axon diameter, or the distribution of axon diameters, differs between groups. We want to implement tests that take account of within and between animal variance.
+
+
+# Load and format data
+```{r message = FALSE}
+df <- read_excel("Myrf_AxonDiameter.xlsx", range = "A1:H302") %>%
+    pivot_longer(cols = 1:8) %>%
+    drop_na() %>%
+    mutate(group = as_factor(ifelse(name %in% c("C-ON7", "C-ON12", "C-ON30", "C-ON55"), "control", "mutant")))
+
+df$group <- as.factor(df$group)
+df$name <- as.factor(df$name)
+```
+
+# Plot the data
+Plot of individual mice, colour coded by group.
+```{r}
+(plot_by_id <- ggplot(data = df, aes(name, value)) +
+     geom_violin(aes(colour = group), draw_quantiles = c(0.25, 0.5, 0.75)) +
+     theme_cowplot(font_size = 14) +
+     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(x = 'Animal', y = 'Diameter (µm)', colour = "Group"))
+
+#ggsave('Plots/violins.jpeg', plot_by_id)
+```
+
+# Descriptive Statistics per animal
+```{r}
+# Compute 25th, 50th, and 75th percentiles per animal
+df_summary <- df %>%
+  group_by(group, name) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE),
+    q75 = quantile(value, 0.75, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_summary
+```
+
+# Visualization of quantile data:
+```{r}
+
+df_quant <- df %>%
+  group_by(name, group) %>%
+  summarise(
+    q25 = quantile(value, 0.25),
+    q50 = quantile(value, 0.5),
+    q75 = quantile(value, 0.75),
+    .groups = "drop"
+  )
+
+# Convert to long format for plotting
+df_quant_long <- df_quant %>%
+  pivot_longer(cols = q25:q75, names_to = "quantile", values_to = "value")
+
+# Compute group-level summary: mean and SD per quantile
+df_group_summary <- df_quant_long %>%
+  group_by(group, quantile) %>%
+  summarise(
+    mean_value = mean(value),
+    sd_value = sd(value),
+    .groups = "drop"
+  )
+
+# Plot: outlined bars with individual points and SD
+ggplot(df_group_summary, aes(x = group, y = mean_value)) +
+  geom_col(aes(color = group), fill = NA, width = 0.6, size = 1) +       # outlined bars
+  geom_errorbar(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value),
+                width = 0.2, color = "black") +                          # SD error bars
+  geom_jitter(data = df_quant_long, 
+              aes(x = group, y = value, color = group),
+              width = 0.15, size = 2, alpha = 0.9, inherit.aes = FALSE) + # individual points
+  facet_wrap(~quantile, scales = "free_y") +
+  scale_color_manual(values = c("control" = "steelblue", "mutant" = "salmon")) +
+  theme_cowplot() +
+  labs(
+    y = "Diameter (µm)",
+    x = "",
+    title = "Per-Animal Quantiles by Group with SD"
+  )
+
+
+```
+
+
+# Statistical test per quantile
+```{r}
+
+t.test(q75 ~ group, data = df_quant)
+t.test(q25 ~ group, data = df_quant)
+t.test(q50 ~ group, data = df_quant)
+```
+The above analysis compares per-animal quantiles (25th, median, 75th) using t-tests, which summarizes each animal but ignores the hierarchical structure of the data and discards within-animal variability. Therefore, here we are using a linear mixed model to test for group differences in mean axon diameter to account for the full data structure.
+
+# Tests for differences in means
+```{r}
+mm <- lmer(value ~ group + (1 | name), data = df)
+mm_null <- lmer(value ~ (1 | name), data = df)
+summary(mm)
+anova(mm, mm_null)
+```
+Because the data is not normally distributed, the data can be log transformed.  This is closer to a normal distribution.
+
+# Analyse log transformed data 
+Note - Natural log, not log10.
+
+Plot of individual mice, colour coded by group.
+```{r}
+
+(plot_by_id2 <- ggplot(data = df, aes(name, log(value))) +
+     geom_violin(aes(colour = group), draw_quantiles = c(0.25, 0.5, 0.75)) +
+     theme_cowplot(font_size = 14) +
+     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    labs(x = 'Animal', y = 'log(Diameter)', colour = "Group"))
+
+```
+
+Tests for differences in means
+```{r}
+mm_t <- lmer(log(value) ~ group + (1 | name), data = df)
+mm_t_null <- lmer(log(value) ~ (1 | name), data = df)
+summary(mm_t)
+anova(mm_t, mm_t_null)
+```
+
+
+# Evaluate residuals. 
+```{r fig.width = 7, fig.height = 2}
+df$residuals_mm_t <- resid(mm_t)
+df$fitted_mm_t <- fitted(mm_t)
+(res_t_plot <- ggplot(data = df, aes(x = fitted_mm_t, y = residuals_mm_t)) +
+    geom_point(aes(colour = group)) +
+    theme_cowplot())
+```
+
+
+# Check for difference in residual variance between the two groups
+```{r}
+
+mm_hom <- lme((value) ~ group, random = ~1 | name, data = df) #LMM that assumes equal residual variance (homoscedasticity)
+
+mm_het <- lme((value) ~ group, random = ~1 | name, #LMM that allows different residual variances for each group (heteroscedasticity)
+              weights = varIdent(form = ~1 | group),
+              data = df)
+
+anova(mm_hom, mm_het)
+
+
+```
+Based on this analysis, the mm_het fits significantly better.
+
+
+# Test for differences in means using heteroscedastic model
+```{r}
+summary(mm_het)
+```
+```{r}
+mm_het_ML <- update(mm_het, method = "ML")
+mm_het_null_ML <- update(mm_het, . ~ . - group, method = "ML")
+
+anova(mm_het_ML, mm_het_null_ML)
+```
+
+No significant difference between control and mutant using this updated model.
+
+Now repeat for the log transformed data.
+
+```{r}
+
+mm_t_hom <- lme(log(value) ~ group, random = ~1 | name, data = df)
+
+mm_t_het <- lme(log(value) ~ group, random = ~1 | name,
+              weights = varIdent(form = ~1 | group),
+              data = df)
+
+anova(mm_t_hom, mm_t_het)
+
+
+```
+
+```{r}
+summary(mm_t_het)
+```
+```{r}
+mm_t_het_ML <- update(mm_t_het, method = "ML")
+mm_t_het_null_ML <- update(mm_t_het, . ~ . - group, method = "ML")
+
+anova(mm_t_het_ML, mm_t_het_null_ML)
+```
+
+
+# Histograms of log transformed data
+```{r}
+
+# Unique animal names
+names <- unique(df$name)
+
+# Function to generate histogram tibble per animal
+histfun_df <- function(name, df, submean = 0) {
+  # Optionally subtract mean
+  sub <- if(submean == 1) mean(df$value[df$name == name]) else 0
+  # Compute histogram (log-transformed)
+  h <- hist(log(df$value[df$name == name] - sub),
+            breaks = seq(-4, 4, 0.1), plot = FALSE)
+  # Return as tibble with group info
+  tibble(mids = h$mids,
+         density = h$density,
+         animal = name,
+         group = unique(df$group[df$name == name]))
+}
+
+# Generate all histograms and combine into one tibble
+hists_tib <- map_df(names, histfun_df, df = df, submean = 0)
+
+# Plot all histograms with faceting and coloring by group
+ggplot(hists_tib, aes(x = mids, y = density, fill = group)) +
+  geom_col(position = "dodge", color = "black") +
+  facet_wrap(~animal, scales = "free_y") +
+  theme_cowplot() +
+  labs(x = "log(Diameter)", y = "Density", title = "Histograms per Animal") +
+  scale_fill_manual(values = c("control" = "steelblue", "mutant" = "salmon"))
+```
+
+
+# Evaluate distributions 
+Untransformed data
+```{r}
+fit.lqmm <- lqmm(fixed = value ~ group, random = ~1, group = name, tau = c(0.25,0.5, 0.75), nK = 7, type = "normal", data = df, control = c(method = "df", LP_max_iter = 5000))
+summary(fit.lqmm, R = 500, seed = 2)
+```
+
+Log transformed data
+```{r}
+fit.log.lqmm <- lqmm(fixed = log(value) ~ group, random = ~1, group = name, tau = c(0.25,0.5, 0.75), nK = 7, type = "normal", data = df, control = c(method = "df", LP_max_iter = 5000))
+summary(fit.log.lqmm, R = 500, seed = 2)
+```
+
+
+
+
+
